@@ -109,6 +109,7 @@ const MAX_PROTOCOL_VERSION: u64 = 37;
 //             Enable shared object deletion in mainnet.
 //             Set the consensus accepted transaction size and the included transactions size in the proposed block.
 // Version 37: Reject entry functions with mutable Random.
+// Version 38: Reject PTBs that contain invalid commands after one that uses Random.
 #[derive(Copy, Clone, Debug, Hash, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion(u64);
 
@@ -387,6 +388,10 @@ struct FeatureFlags {
     // Reject functions with mutable Random.
     #[serde(skip_serializing_if = "is_false")]
     reject_mutable_random_on_entry_functions: bool,
+
+    // Limit PTBs that contain invalid commands after one that uses Random.
+    #[serde(skip_serializing_if = "is_false")]
+    enable_randomness_ptb_limits: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1159,6 +1164,10 @@ impl ProtocolConfig {
     pub fn reject_mutable_random_on_entry_functions(&self) -> bool {
         self.feature_flags.reject_mutable_random_on_entry_functions
     }
+
+    pub fn enable_randomness_ptb_limits(&self) -> bool {
+        self.feature_flags.enable_randomness_ptb_limits
+    }
 }
 
 #[cfg(not(msim))]
@@ -1902,6 +1911,9 @@ impl ProtocolConfig {
                     if chain != Chain::Mainnet {
                         cfg.feature_flags.include_consensus_digest_in_prologue = true;
                     }
+                }
+                38 => {
+                    cfg.feature_flags.enable_randomness_ptb_limits = true;
                 }
                 // Use this template when making changes:
                 //
