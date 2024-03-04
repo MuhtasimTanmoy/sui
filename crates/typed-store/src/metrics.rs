@@ -796,7 +796,7 @@ impl WritePerfContextMetrics {
                 registry,
             )
             .unwrap(),
-            write_pre_and_post_process_nanos: register_int_counter_vec_with_registry!(
+                write_pre_and_post_process_nanos: register_int_counter_vec_with_registry!(
                 "write_pre_and_post_process_nanos",
                 "Total nanos spent on writing a record, excluding the above four things",
                 &["cf_name"],

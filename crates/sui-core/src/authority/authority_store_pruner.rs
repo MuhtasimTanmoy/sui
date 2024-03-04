@@ -119,6 +119,101 @@ pub enum PruningMode {
 
 impl AuthorityStorePruner {
     /// prunes old versions of objects based on transaction effects
+    async fn prune_objects_return_keys(
+        transaction_effects: Vec<TransactionEffects>,
+        perpetual_db: &Arc<AuthorityPerpetualTables>,
+        objects_lock_table: &Arc<RwLockTable<ObjectContentDigest>>,
+        checkpoint_number: CheckpointSequenceNumber,
+        metrics: Arc<AuthorityStorePruningMetrics>,
+        indirect_objects_threshold: usize,
+        enable_pruning_tombstones: bool,
+        updates: &mut HashMap<ObjectID, (VersionNumber, VersionNumber)>
+    ) -> anyhow::Result<()> {
+        let _scope = monitored_scope("ObjectsLivePruner");
+        let mut wb = perpetual_db.objects.batch();
+
+        // Collect objects keys that need to be deleted from `transaction_effects`.
+        let mut live_object_keys_to_prune = vec![];
+        let mut object_tombstones_to_prune = vec![];
+        for effects in &transaction_effects {
+            for (object_id, seq_number) in effects.modified_at_versions() {
+                live_object_keys_to_prune.push(ObjectKey(object_id, seq_number));
+            }
+            if enable_pruning_tombstones {
+                for deleted_object_key in effects.all_tombstones() {
+                    object_tombstones_to_prune
+                        .push(ObjectKey(deleted_object_key.0, deleted_object_key.1));
+                }
+            }
+        }
+
+        metrics
+            .num_pruned_objects
+            .inc_by(live_object_keys_to_prune.len() as u64);
+        metrics
+            .num_pruned_tombstones
+            .inc_by(object_tombstones_to_prune.len() as u64);
+
+        let mut indirect_objects: HashMap<_, i64> = HashMap::new();
+        if indirect_objects_threshold > 0 && indirect_objects_threshold < usize::MAX {
+            for object in perpetual_db
+                .objects
+                .multi_get(live_object_keys_to_prune.iter())?
+                .into_iter()
+                .flatten()
+            {
+                if let StoreObject::Value(obj) = object.into_inner() {
+                    if let StoreData::IndirectObject(indirect_object) = obj.data {
+                        *indirect_objects.entry(indirect_object.digest).or_default() -= 1;
+                    }
+                }
+            }
+        }
+
+        for ObjectKey(object_id, seq_number) in live_object_keys_to_prune {
+            updates
+                .entry(object_id)
+                .and_modify(|range| *range = (min(range.0, seq_number), max(range.1, seq_number)))
+                .or_insert((seq_number, seq_number));
+        }
+
+        // When enable_pruning_tombstones is enabled, instead of using range deletes, we need to do a scan of all the keys
+        // for the deleted objects and then do point deletes to delete all the existing keys. This is because to improve read
+        // performance, we set `ignore_range_deletions` on all read options, and using range delete to delete tombstones
+        // may leak object (imagine a tombstone is compacted away, but earlier version is still not). Using point deletes
+        // guarantees that all earlier versions are deleted in the database.
+        let mut object_keys_to_delete = vec![];
+        if !object_tombstones_to_prune.is_empty() {
+            for ObjectKey(object_id, seq_number) in object_tombstones_to_prune {
+                for result in perpetual_db.objects.safe_iter_with_bounds(
+                    Some(ObjectKey(object_id, VersionNumber::MIN)),
+                    Some(ObjectKey(object_id, seq_number.next())),
+                ) {
+                    let (object_key, _) = result?;
+                    assert_eq!(object_key.0, object_id);
+                    object_keys_to_delete.push(object_key);
+                }
+            }
+        }
+
+        if !indirect_objects.is_empty() {
+            let ref_count_update = indirect_objects
+                .iter()
+                .map(|(digest, delta)| (digest, delta.to_le_bytes()));
+            wb.partial_merge_batch(&perpetual_db.indirect_move_objects, ref_count_update)?;
+        }
+        perpetual_db.set_highest_pruned_checkpoint(&mut wb, checkpoint_number)?;
+        metrics.last_pruned_checkpoint.set(checkpoint_number as i64);
+
+        let _locks = objects_lock_table
+            .acquire_locks(indirect_objects.into_keys())
+            .await;
+        wb.write()?;
+        Ok(())
+    }
+
+
+    /// prunes old versions of objects based on transaction effects
     async fn prune_objects(
         transaction_effects: Vec<TransactionEffects>,
         perpetual_db: &Arc<AuthorityPerpetualTables>,
@@ -391,7 +486,7 @@ impl AuthorityStorePruner {
         let mut checkpoints_to_prune = vec![];
         let mut checkpoint_content_to_prune = vec![];
         let mut effects_to_prune = vec![];
-
+        let mut updates: HashMap<ObjectID, (VersionNumber, VersionNumber)> = HashMap::new();
         loop {
             let Some(ckpt) = checkpoint_store
                 .certified_checkpoints
@@ -433,7 +528,7 @@ impl AuthorityStorePruner {
             {
                 match mode {
                     PruningMode::Objects => {
-                        Self::prune_objects(
+                        Self::prune_objects_return_keys(
                             effects_to_prune,
                             perpetual_db,
                             objects_lock_table,
@@ -441,6 +536,7 @@ impl AuthorityStorePruner {
                             metrics.clone(),
                             indirect_objects_threshold,
                             !config.killswitch_tombstone_pruning,
+                            &mut updates,
                         )
                         .await?
                     }
@@ -463,7 +559,7 @@ impl AuthorityStorePruner {
         if !checkpoints_to_prune.is_empty() {
             match mode {
                 PruningMode::Objects => {
-                    Self::prune_objects(
+                    Self::prune_objects_return_keys(
                         effects_to_prune,
                         perpetual_db,
                         objects_lock_table,
@@ -471,6 +567,7 @@ impl AuthorityStorePruner {
                         metrics.clone(),
                         indirect_objects_threshold,
                         !config.killswitch_tombstone_pruning,
+                        &mut updates
                     )
                     .await?
                 }
@@ -485,6 +582,18 @@ impl AuthorityStorePruner {
                 )?,
             };
         }
+        let mut wb = perpetual_db.objects.batch();
+        for (object_id, (min_version, max_version)) in updates {
+            debug!(
+                "Pruning object {:?} versions {:?} - {:?}",
+                object_id, min_version, max_version
+            );
+            let start_range = ObjectKey(object_id, min_version);
+            let end_range = ObjectKey(object_id, (max_version.value() + 1).into());
+            wb.schedule_delete_range(&perpetual_db.objects, &start_range, &end_range)?;
+        }
+        wb.write()?;
+
         Ok(())
     }
 
