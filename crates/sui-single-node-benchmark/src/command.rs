@@ -44,6 +44,11 @@ pub struct Command {
         ignore_case = true,
         help = "Which component to benchmark"
     )]
+    #[arg(
+        long,
+        help = "If true, skip signing on the validators, instead, creating certificates directly using validator secrets"
+    )]
+    pub skip_signing: bool,
     pub component: Component,
     #[clap(subcommand)]
     pub workload: WorkloadKind,
