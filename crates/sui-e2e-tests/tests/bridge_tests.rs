@@ -61,7 +61,7 @@ async fn test_committee_registration() {
     telemetry_subscribers::init_for_testing();
     let test_cluster: test_cluster::TestCluster = TestClusterBuilder::new()
         .with_protocol_version(37.into())
-        .with_epoch_duration_ms(10000)
+        .with_epoch_duration_ms(20000)
         .build()
         .await;
     let ref_gas_price = test_cluster.get_reference_gas_price().await;
