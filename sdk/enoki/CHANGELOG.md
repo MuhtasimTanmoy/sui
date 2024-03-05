@@ -1,5 +1,14 @@
 # @mysten/enoki
 
+## 0.1.4
+
+### Patch Changes
+
+- f704211291: Add EnokiClientError to expose error details
+- Updated dependencies [0cafa94027]
+  - @mysten/sui.js@0.51.0
+  - @mysten/zklogin@0.4.4
+
 ## 0.1.3
 
 ### Patch Changes
